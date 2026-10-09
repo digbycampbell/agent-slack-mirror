@@ -201,6 +201,30 @@ SLACK_MIRROR_PROMPT_LABEL='Env label:' "$POST" general --origin mirror 'Env labe
 [ "$(body_field .text)" = 'Env label: hi' ] || fail "the environment label must win, as it does in the mirror"
 pass "a mirrored terminal prompt stays unquoted"
 
+# --- a manual post hands its body to the mirror's note-post -----------------
+
+home=$(new_home notepost)
+use_home "$home"
+cat > "$TMP_ROOT/fake-mirror" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_MIRROR_ARGV"
+cat >> "$FAKE_MIRROR_STDIN"
+SH
+chmod +x "$TMP_ROOT/fake-mirror"
+export FAKE_MIRROR_ARGV="$TMP_ROOT/mirror.argv" FAKE_MIRROR_STDIN="$TMP_ROOT/mirror.stdin"
+: > "$FAKE_MIRROR_ARGV"; : > "$FAKE_MIRROR_STDIN"
+SLACK_MIRROR_CMD="$TMP_ROOT/fake-mirror" "$POST" general --worker-details 'm high' 'progress note' >/dev/null \
+  || fail "a manual post should succeed"
+[ "$(cat "$FAKE_MIRROR_ARGV")" = "note-post $CHANNEL --body-file -" ] \
+  || fail "a manual post must call note-post with the body on stdin: $(cat "$FAKE_MIRROR_ARGV")"
+[ "$(cat "$FAKE_MIRROR_STDIN")" = 'progress note' ] \
+  || fail "note-post must get the body as written, without stamp or quote bar: $(cat "$FAKE_MIRROR_STDIN")"
+: > "$FAKE_MIRROR_ARGV"
+SLACK_MIRROR_CMD="$TMP_ROOT/fake-mirror" "$POST" general --origin mirror 'relayed' >/dev/null \
+  || fail "a mirror post should succeed"
+[ ! -s "$FAKE_MIRROR_ARGV" ] || fail "the mirror's own post must not be recorded as deliberate"
+pass "a manual post records its body for the mirror, and a mirror post does not"
+
 # --- failures are loud ------------------------------------------------------
 
 printf '{"ok":false,"error":"channel_not_found"}\n' > "$FAKE_SLACK_RESPONSE"

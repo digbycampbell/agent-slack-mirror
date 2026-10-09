@@ -46,8 +46,10 @@
 # that status, so the guarantee is defense in depth for the synchronous callers.
 #
 # ORIGIN. A successful post to the configured captain channel is recorded with
-# slack-mirror.sh `note-post`, which is how the terminal mirror knows the host
-# already spoke in this turn and must not mirror it a second time.
+# slack-mirror.sh `note-post --body-file -`, with the message text as written
+# (before the worker-details stamp and the quote bar) on stdin, which is how the
+# terminal mirror knows the host already said this and must not mirror a reply
+# that repeats it.
 # `--origin mirror` marks the mirror's own delivery and skips that record, so
 # the mirror cannot suppress itself on the following turn. The default is
 # `manual`, so every ordinary hand-written post counts.
@@ -289,6 +291,7 @@ else
 fi
 [ -n "$text" ] || die "the message is empty"
 [ "${#text}" -le "$MAX_BODY_BYTES" ] || die "the message is longer than $MAX_BODY_BYTES characters"
+posted_text=$text
 [ -z "$DETAILS" ] || text=$(printf '%s\n\n_worker: %s_' "$text" "$DETAILS")
 mirrored_prompt=0
 ! is_mirrored_prompt "$text" || mirrored_prompt=1
@@ -347,7 +350,10 @@ if [ -n "$watched" ] && [ "$watched" = "$channel" ] && [ "$ORIGIN" = manual ]; t
   export SLACK_MIRROR_STATE_DIR="${SLACK_MIRROR_STATE_DIR:-${SLACK_STATE_DIR:-}}"
   export SLACK_MIRROR_CONFIG_FILE="${SLACK_MIRROR_CONFIG_FILE:-${SLACK_CONFIG_FILE:-}}"
   export SLACK_MIRROR_POST_CMD="${SLACK_MIRROR_POST_CMD:-$SCRIPT_DIR/slack-post.sh}"
-  [ -x "$MIRROR_CMD" ] && "$MIRROR_CMD" note-post "$channel" >/dev/null 2>&1 || true
+  if [ -x "$MIRROR_CMD" ]; then
+    printf '%s\n' "$posted_text" \
+      | "$MIRROR_CMD" note-post "$channel" --body-file - >/dev/null 2>&1 || true
+  fi
 fi
 if [ -n "$watched" ] && [ "$watched" = "$channel" ] && [ -n "$THREAD" ]; then
   "$CAPTAIN_CMD" track-thread "$channel" "$THREAD" >/dev/null 2>&1 \

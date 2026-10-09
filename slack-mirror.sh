@@ -11,7 +11,9 @@
 #
 # Usage:
 #   slack-mirror.sh turn-end [--harness <name>]   turn-end entry, payload on stdin
-#   slack-mirror.sh note-post <channel>           record a deliberate outbound post
+#   slack-mirror.sh note-post <channel> [--body-file <path>|-]
+#                                                 record a deliberate outbound post
+#                                                 (`-` reads the body from stdin)
 #   slack-mirror.sh note-inbound <channel> <message-ts> [thread-ts]
 #   slack-mirror.sh note-trigger <channel> <source-id> <sequence> <thread-ts|none>
 #   slack-mirror.sh note-reply-target <channel> <thread-ts|none>
@@ -92,11 +94,14 @@
 # bodies are never both sent.
 #
 # NO DOUBLE POST. When the host posts deliberately, it records that here with
-# `note-post`, and a turn whose own window already contains a deliberate post to
-# the mirrored channel is not mirrored. The record is a durable timestamp
-# compared against the turn's start, never a comparison of message text, so a
-# deliberate post that says something different from the terminal reply still
-# suppresses the mirror.
+# `note-post <channel> --body-file <path>` (`-` for stdin), which stores the epoch
+# and a digest of the post's body. A turn's reply is not mirrored only when its
+# digest equals the digest of a deliberate post recorded since that turn began, so
+# a reply that merely repeats what the host already said stays out of the channel
+# while a reply carrying anything new is still mirrored after a progress note or an
+# upload. A `note-post` with no body records the epoch alone and suppresses nothing,
+# for hosts that have not been updated to pass one. A turn that also posted
+# deliberately mirrors its prompt after that deliberate post, as described above.
 #
 # THREAD CORRECTNESS. Slack does not render a channel message inside a thread
 # view, so a reply to a message written in a thread must go back into that
@@ -188,6 +193,10 @@
 #   mirror.last-prompt    identity of the last mirrored human prompt, so a
 #                         re-delivered turn end never posts it twice
 #   mirror.last-post      epoch of the last deliberate post to the channel
+#   mirror.post-digests   newest-first log, one `epoch=<s> digest=<sha256>` line per
+#                         deliberate post that was recorded with a body, bounded to
+#                         the newest POST_DIGESTS_MAX; `turn-end` compares the
+#                         reply's digest against the lines dated since the turn began
 #   mirror.inbound        the newest captured inbound message and its thread, if any
 #   mirror.reply-target   the thread the host recorded for this turn's reply,
 #                         consumed by `turn-end`; a deterministic override of inbound
@@ -204,8 +213,9 @@ POST_CMD="${SLACK_MIRROR_POST_CMD:-}"
 INBOUND_SCHEMA=fm-slack-mirror-inbound.v1
 REPLY_TARGET_SCHEMA=fm-slack-mirror-reply-target.v1
 CORRELATE_SCHEMA=fm-slack-mirror-correlate.v1
+POST_DIGESTS_MAX=20
 
-usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # An environment override under either spelling: the tool's own name first, then
 # the legacy host-prefixed one, so a host that already exports the old name keeps
@@ -387,12 +397,62 @@ is_injected_prompt() {  # <text>
 
 # --- recording ---------------------------------------------------------------
 
-cmd_note_post() {  # <channel>
-  local channel=${1-} watched
+# Record a deliberate post: always the epoch, and, when a body is given, a digest
+# of it for the reply-repeat test. The body is read only when asked for
+# (`--body-file`), never from an inherited stdin, so a caller that passes none can
+# never block here.
+cmd_note_post() {  # <channel> [--body-file <path>|-]
+  local channel=${1-} watched source='' text digest path existing dir tmp
+  shift 2>/dev/null || true
+  case "$#" in
+    0) ;;
+    2) [ "$1" = --body-file ] || usage; source=$2 ;;
+    *) usage ;;
+  esac
   valid_slack_id "$channel" || return 0
   watched=$(mirrored_channel) || return 0
   [ "$watched" = "$channel" ] || return 0
   state_write "$MIRROR_DIR/mirror.last-post" "$(now_epoch)" || return 0
+  [ -n "$source" ] || return 0
+
+  if [ "$source" = - ]; then
+    text=$(cat 2>/dev/null) || return 0
+  else
+    [ -f "$source" ] && [ ! -L "$source" ] || return 0
+    text=$(cat -- "$source" 2>/dev/null) || return 0
+  fi
+  [ -n "$text" ] || return 0
+  digest=$(body_digest "$text") || return 0
+
+  path="$MIRROR_DIR/mirror.post-digests"
+  existing=
+  if [ -f "$path" ] && [ ! -L "$path" ]; then
+    existing=$(head -n "$((POST_DIGESTS_MAX - 1))" "$path" 2>/dev/null) || existing=
+  fi
+  dir=$(dirname "$path")
+  (umask 077; mkdir -p "$dir") || return 0
+  tmp=$(umask 077; mktemp "$dir/.mirror.XXXXXX") || return 0
+  {
+    printf 'epoch=%s digest=%s\n' "$(now_epoch)" "$digest"
+    [ -z "$existing" ] || printf '%s\n' "$existing"
+  } > "$tmp" 2>/dev/null || { rm -f -- "$tmp"; return 0; }
+  [ ! -L "$path" ] || { rm -f -- "$tmp"; return 0; }
+  mv -f -- "$tmp" "$path" 2>/dev/null || rm -f -- "$tmp"
+  return 0
+}
+
+# 0 when a deliberate post recorded at or after <since> carries this digest.
+posted_since() {  # <digest> <since-epoch>
+  local path="$MIRROR_DIR/mirror.post-digests" line epoch rec
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
+  while IFS= read -r line; do
+    epoch=${line#epoch=}; epoch=${epoch%% *}
+    rec=${line##* digest=}
+    case "$epoch" in ''|*[!0-9]*) continue ;; esac
+    [ "$epoch" -ge "$2" ] || continue
+    [ "$rec" = "$1" ] && return 0
+  done < "$path"
+  return 1
 }
 
 cmd_note_inbound() {  # <channel> <message-ts> [thread-ts]
@@ -627,7 +687,7 @@ cmd_adapters() {
 cmd_turn_end() {
   local payload_file tmpdir adapter record
   local channel enabled ack_max window max_chars details_flag prompts_flag
-  local body turn_epoch post_epoch digest last_digest thread details
+  local body turn_epoch digest last_digest thread details
   local prompt prompt_id prompt_key last_prompt reply_ok=0 prompt_ok=0
   local REPLY_TARGET_SET=0 REPLY_TARGET_THREAD=
   local TURN_TEXT='' TRIGGER_MODE=fallback TRIGGER_THREAD=''
@@ -681,33 +741,32 @@ cmd_turn_end() {
   details_flag=$(setting_flag "$(env_override _WORKER_DETAILS)" mirror_worker_details off)
   prompts_flag=$(setting_flag "$(env_override _PROMPTS)" mirror_prompts on)
 
-  # THE REPLY: substantive, not already posted deliberately this turn, and not a
-  # repeat of the last mirrored body.
+  # THE REPLY: substantive, not a repeat of a deliberate post made this turn, and
+  # not a repeat of the last mirrored body.
   if [ -n "$body" ] && is_substantive "$body" "$ack_max"; then
     reply_ok=1
-    # A deliberate post inside this turn's own window is the message; mirroring
-    # it again would double-post.
-    post_epoch=$(state_read "$MIRROR_DIR/mirror.last-post" 2>/dev/null || true)
-    case "$post_epoch" in
-      ''|*[!0-9]*) ;;
-      *)
-        case "$turn_epoch" in
-          ''|*[!0-9]*)
-            # No dated turn start, so fall back to an assumed turn length rather
-            # than losing the duplicate test entirely.
-            turn_epoch=$(( $(now_epoch) - $(setting_int "$(env_override _TURN_WINDOW)" \
-              mirror_turn_window 900) ))
-            ;;
-        esac
-        [ "$post_epoch" -lt "$turn_epoch" ] || reply_ok=0
+    case "$turn_epoch" in
+      ''|*[!0-9]*)
+        # No dated turn start, so fall back to an assumed turn length rather
+        # than losing the duplicate test entirely.
+        turn_epoch=$(( $(now_epoch) - $(setting_int "$(env_override _TURN_WINDOW)" \
+          mirror_turn_window 900) ))
         ;;
     esac
+    # The host recorded what it posted, so only a reply that says the same thing
+    # is a double post; a different deliberate post leaves the reply to be mirrored.
+    # The untruncated digest is tested too, since a host posts the body whole.
+    digest=$(body_digest "$body") || return 0
+    ! posted_since "$digest" "$turn_epoch" || reply_ok=0
   fi
   if [ "$reply_ok" = 1 ]; then
     if [ "${#body}" -gt "$max_chars" ]; then
       body=$(printf '%s\n\n_[truncated by the terminal mirror]_' "${body:0:$max_chars}")
+      digest=$(body_digest "$body") || return 0
+      ! posted_since "$digest" "$turn_epoch" || reply_ok=0
     fi
-    digest=$(body_digest "$body") || return 0
+  fi
+  if [ "$reply_ok" = 1 ]; then
     last_digest=$(state_read "$MIRROR_DIR/mirror.last-body" 2>/dev/null || true)
     [ "$digest" != "$last_digest" ] || reply_ok=0
   fi
@@ -877,7 +936,7 @@ case "${1-}" in
     [ "$#" -eq 0 ] || usage
     cmd_turn_end
     ;;
-  note-post)    shift; [ "$#" -eq 1 ] || usage; cmd_note_post "$@" ;;
+  note-post)    shift; [ "$#" -ge 1 ] || usage; cmd_note_post "$@" ;;
   note-inbound) shift; [ "$#" -ge 2 ] && [ "$#" -le 3 ] || usage; cmd_note_inbound "$@" ;;
   note-trigger) shift; [ "$#" -eq 4 ] || usage; cmd_note_trigger "$@" ;;
   note-reply-target) shift; [ "$#" -eq 2 ] || usage; cmd_note_reply_target "$@" ;;
