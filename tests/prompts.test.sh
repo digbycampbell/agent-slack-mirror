@@ -397,6 +397,70 @@ run_turn_end "$host" "$t"
 expect_eq "details: prompt unstamped" "=== POST channel=$CHANNEL args=--origin mirror" "$(post_args 1)"
 expect_eq "details: reply stamped" "=== POST channel=$CHANNEL args=--origin mirror --worker-details claude-opus-5-5 low" "$(post_args 2)"
 
+# --- a deliberate post suppresses the reply only when the reply repeats it ----
+
+# The host records a deliberate post as `bin/slack-post.sh` does: body on stdin.
+note_post() {  # <host> <body>
+  printf '%s\n' "$2" | env SLACK_MIRROR_STATE_DIR="$1/state" SLACK_MIRROR_CONFIG_FILE="$1/config" \
+    "$MIRROR" note-post "$CHANNEL" --body-file -
+}
+
+# A deliberate post that says something else leaves the reply, and the prompt, mirrored.
+host=$(new_host deliberate-different)
+t="$host/t.jsonl"
+human_prompt "$t" u-delib-1 'what is the status of the queue?'
+tool_round "$t"
+assistant_reply "$t" "$SUBSTANTIVE_REPLY"
+note_post "$host" 'Progress: the first half of the queue is merged, continuing.'
+: > "$FAKE_POST_LOG"
+run_turn_end "$host" "$t"
+expect_eq "deliberate different: post count" 2 "$(post_count)"
+expect_eq "deliberate different: prompt first" 'Digby (terminal): what is the status of the queue?' "$(post_text 1)"
+expect_eq "deliberate different: reply mirrored" "$SUBSTANTIVE_REPLY" "$(post_text 2)"
+
+# Several deliberate posts, none of them the reply: still mirrored.
+host=$(new_host deliberate-several)
+t="$host/t.jsonl"
+assistant_reply "$t" "$SUBSTANTIVE_REPLY"
+note_post "$host" 'First progress note with a link https://example.com/a'
+note_post "$host" 'Second note: uploaded the file.'
+: > "$FAKE_POST_LOG"
+run_turn_end "$host" "$t"
+expect_eq "deliberate several: reply mirrored" "$SUBSTANTIVE_REPLY" "$(post_text 1)"
+
+# A deliberate post whose body is the reply is the message: nothing is mirrored,
+# and with no reply mirrored a short typed prompt stays out too.
+host=$(new_host deliberate-same)
+t="$host/t.jsonl"
+human_prompt "$t" u-delib-2 'yes'
+assistant_reply "$t" "$SUBSTANTIVE_REPLY"
+note_post "$host" 'Earlier progress note, different text.'
+note_post "$host" "$SUBSTANTIVE_REPLY"
+: > "$FAKE_POST_LOG"
+run_turn_end "$host" "$t"
+expect_no_posts "deliberate same"
+
+# A body-less note-post records the time alone and suppresses nothing.
+host=$(new_host deliberate-bodyless)
+t="$host/t.jsonl"
+assistant_reply "$t" "$SUBSTANTIVE_REPLY"
+env SLACK_MIRROR_STATE_DIR="$host/state" SLACK_MIRROR_CONFIG_FILE="$host/config" \
+  "$MIRROR" note-post "$CHANNEL"
+expect_eq "bodyless: epoch recorded" 1 "$([ -s "$host/state/mirror.last-post" ] && echo 1 || echo 0)"
+: > "$FAKE_POST_LOG"
+run_turn_end "$host" "$t"
+expect_eq "bodyless: reply mirrored" "$SUBSTANTIVE_REPLY" "$(post_text 1)"
+
+# A deliberate post from before this turn began does not suppress a later repeat.
+host=$(new_host deliberate-old)
+t="$host/t.jsonl"
+assistant_reply "$t" "$SUBSTANTIVE_REPLY"
+note_post "$host" "$SUBSTANTIVE_REPLY"
+sed -i 's/^epoch=[0-9]*/epoch=1000/' "$host/state/mirror.post-digests"
+: > "$FAKE_POST_LOG"
+run_turn_end "$host" "$t"
+expect_eq "deliberate old: stale post does not suppress" "$SUBSTANTIVE_REPLY" "$(post_text 1)"
+
 # --- never a gate -------------------------------------------------------------
 
 host=$(new_host gate)
