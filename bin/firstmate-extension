@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# process-event-adapter/1 entrypoint for the Slack captain listener.
+#
+# The host invokes this with verb `handshake` or `invoke` and one JSON envelope
+# on stdin. Logs go to stderr. See docs/firstmate-integration.md for why the
+# host must still call bin/slack-captain.sh handle after capture, and why the
+# native CLI is the production poll path until the host envelope grows.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CAPTAIN="$SCRIPT_DIR/slack-captain.sh"
+EXTENSION_ID=org.digbycampbell.agent-slack-mirror
+EXTENSION_VERSION=1.0.0
+ADAPTER_NAME=slack-captain
+MAX_INPUT=65536
+MAX_RESULT=32768
+
+die_internal() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+read_request() {
+  local tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/slack-ext-req.XXXXXX") || die_internal "cannot stage request"
+  dd bs="$MAX_INPUT" count=1 of="$tmp" status=none 2>/dev/null || true
+  if [ "$(wc -c < "$tmp")" -gt "$MAX_INPUT" ]; then
+    rm -f -- "$tmp"
+    die_internal "request is oversized"
+  fi
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; die_internal "request is not JSON"; }
+  cat "$tmp"
+  rm -f -- "$tmp"
+}
+
+handshake_reply() {  # <request-json>
+  jq -c --arg id "$EXTENSION_ID" --arg ver "$EXTENSION_VERSION" '
+    {
+      schema: "firstmate.extension-handshake-response.v1",
+      request_id: .request_id,
+      extension_id: $id,
+      extension_version: $ver,
+      host_protocol: 1,
+      capability: "process-event-adapter",
+      capability_version: 1,
+      adapter_names: .capability.adapter_names
+    }
+  ' <<<"$1"
+}
+
+fail_reply() {  # <request-id> <code> <retryable-true-false> <diagnostic>
+  jq -nc --arg rid "$1" --arg code "$2" --argjson retry "$3" --arg diag "$4" '{
+    schema: "firstmate.extension-response.v1",
+    request_id: $rid,
+    ok: false,
+    result: null,
+    error: {code: $code, retryable: $retry, diagnostic: $diag}
+  }'
+}
+
+ok_reply() {  # <request-id> <result-json>
+  jq -nc --arg rid "$1" --argjson result "$2" '{
+    schema: "firstmate.extension-response.v1",
+    request_id: $rid,
+    ok: true,
+    result: $result,
+    error: null
+  }'
+}
+
+# config_ref form: config=<abs-file>,state=<abs-dir>,token=<abs-file>[,channels=<abs-file>]
+apply_config_ref() {  # <config_ref>
+  local ref=$1 part key val
+  case "$ref" in
+    '') return 1 ;;
+  esac
+  IFS=',' read -ra parts <<<"$ref"
+  for part in "${parts[@]}"; do
+    key=${part%%=*}
+    val=${part#*=}
+    case "$key" in
+      config) export SLACK_CONFIG_FILE=$val ;;
+      state) export SLACK_STATE_DIR=$val ;;
+      token) export SLACK_TOKEN_FILE=$val ;;
+      channels) export SLACK_CHANNELS_FILE=$val ;;
+      *) return 1 ;;
+    esac
+    case "$val" in
+      /*) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ -n "${SLACK_CONFIG_FILE:-}" ] && [ -n "${SLACK_STATE_DIR:-}" ] && [ -n "${SLACK_TOKEN_FILE:-}" ]
+}
+
+op_poll() {  # <request-json>
+  local rid ref out rc
+  rid=$(jq -r '.request_id' <<<"$1")
+  ref=$(jq -r '.input.config_ref // empty' <<<"$1")
+  if ! apply_config_ref "$ref"; then
+    fail_reply "$rid" invalid-request false "config_ref must be config=,state=,token= absolute paths"
+    return 0
+  fi
+  # Stay inside a typical five-minute host bound. Native poll can wait longer;
+  # docs/firstmate-integration.md records that gap.
+  export SLACK_CAPTAIN_MAX_LOOPS="${SLACK_CAPTAIN_MAX_LOOPS:-3}"
+  out=$(mktemp "${TMPDIR:-/tmp}/slack-ext-poll.XXXXXX") || {
+    fail_reply "$rid" internal true "cannot stage poll output"
+    return 0
+  }
+  rc=0
+  "$CAPTAIN" poll > "$out" 2>/dev/null || rc=$?
+  if [ "$rc" -eq 75 ] || [ ! -s "$out" ]; then
+    rm -f -- "$out"
+    ok_reply "$rid" '{"status":"no-result","output":""}'
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$out"
+    fail_reply "$rid" unavailable true "poll failed"
+    return 0
+  fi
+  if [ "$(wc -c < "$out")" -gt "$MAX_RESULT" ]; then
+    rm -f -- "$out"
+    fail_reply "$rid" unavailable false "poll output exceeds the 32768-byte extension envelope"
+    return 0
+  fi
+  ok_reply "$rid" "$(jq -nc --rawfile output "$out" '{status:"result", output:$output}')"
+  rm -f -- "$out"
+}
+
+op_classify() {  # <request-json>
+  local rid content tmp class
+  rid=$(jq -r '.request_id' <<<"$1")
+  tmp=$(mktemp "${TMPDIR:-/tmp}/slack-ext-class.XXXXXX") || {
+    fail_reply "$rid" internal true "cannot stage content"
+    return 0
+  }
+  jq -r '.input.content // empty' <<<"$1" > "$tmp"
+  class=$("$CAPTAIN" classify "$tmp" 2>/dev/null || printf 'unknown\n')
+  rm -f -- "$tmp"
+  ok_reply "$rid" "$(jq -nc --arg c "$class" '{classification:$c}')"
+}
+
+op_terminal() {  # <request-json>
+  local rid
+  rid=$(jq -r '.request_id' <<<"$1")
+  ok_reply "$rid" '{"value":false}'
+}
+
+op_silent() {  # <request-json>
+  local rid
+  rid=$(jq -r '.request_id' <<<"$1")
+  ok_reply "$rid" '{"value":false}'
+}
+
+verb=${1-}
+request=$(read_request) || exit 1
+case "$verb" in
+  handshake)
+    handshake_reply "$request"
+    ;;
+  invoke)
+    rid=$(jq -r '.request_id' <<<"$request")
+    op=$(jq -r '.operation // empty' <<<"$request")
+    case "$op" in
+      source.poll) op_poll "$request" ;;
+      result.classify) op_classify "$request" ;;
+      result.terminal) op_terminal "$request" ;;
+      result.silent) op_silent "$request" ;;
+      *) fail_reply "$rid" invalid-request false "unsupported operation" ;;
+    esac
+    ;;
+  *)
+    die_internal "unsupported extension verb"
+    ;;
+esac
