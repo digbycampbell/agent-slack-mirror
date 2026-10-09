@@ -27,6 +27,12 @@
 # nothing rather than re-posting an older one. The trigger is the newest
 # `user_message_chunk` group, keyed by its `_meta.promptIndex`, which is where a
 # watcher wake naming a captured Slack result lands on this harness.
+#
+# NO HUMAN PROMPT. A `user_message_chunk` carries the same shape whether the
+# human typed it or the host injected it, as a watcher wake or an operational
+# envelope is, so nothing here can tell a typed prompt from an injected one. The
+# record therefore carries no `prompt_text`, and the mirror posts only the reply
+# on this harness rather than guessing from the text.
 set -u
 
 SCAN_LINES=${SLACK_MIRROR_SCAN_LINES:-${FM_SLACK_MIRROR_SCAN_LINES:-800}}
@@ -122,7 +128,7 @@ cmd_extract() {
 case "${1-}" in
   claims)   cmd_claims; exit $? ;;
   extract)  cmd_extract ;;
-  describe) printf 'grok: covered - Stop payload carries lastAssistantMessage and an updates.jsonl transcript naming the turn trigger (verified against grok 1.0.5)\n' ;;
+  describe) printf 'grok: covered - Stop payload carries lastAssistantMessage and an updates.jsonl transcript naming the turn trigger (verified against grok 1.0.5); no human prompt, which updates.jsonl does not mark as typed\n' ;;
   *) printf 'usage: %s claims|extract|describe\n' "${0##*/}" >&2; exit 2 ;;
 esac
 exit 0

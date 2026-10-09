@@ -15,12 +15,13 @@
 #   slack-mirror.sh note-inbound <channel> <message-ts> [thread-ts]
 #   slack-mirror.sh note-trigger <channel> <source-id> <sequence> <thread-ts|none>
 #   slack-mirror.sh note-reply-target <channel> <thread-ts|none>
-#   slack-mirror.sh deliver <channel> <body-file> [--thread <ts>] [--worker-details <d>]
+#   slack-mirror.sh deliver <channel> <body-file> [--prompt-file <path>]
+#                           [--thread <ts>] [--worker-details <d>]
 #   slack-mirror.sh adapters                      print the harness coverage table
 #
 # `deliver` is the detached delivery child `turn-end` starts; it is not a
 # separate feature and removes the staging directory holding <body-file> when it
-# returns.
+# returns. `--prompt-file` names a staged human prompt that is posted first.
 #
 # ENVIRONMENT CONTRACT - the host agent supplies these; nothing here reads a
 # host's own layout or configuration files by name:
@@ -54,6 +55,32 @@
 # it as text; the text is carried verbatim into the Slack request body by
 # SLACK_MIRROR_POST_CMD, so URLs and markdown survive, and only a body longer
 # than `mirror_max_chars` is truncated with a visible marker.
+#
+# THE HUMAN'S OWN PROMPT. A turn the human opened by typing at the terminal is
+# mirrored as both sides of the exchange: the prompt they typed, labelled, and
+# then the reply, posted by one delivery child in that order and into the same
+# thread, so Slack reads as the conversation rather than half of it. The adapter
+# reports the prompt only when its harness marks the turn's opening message as
+# typed by a human; adapters/claude.sh owns that test for its harness. The core
+# then posts nothing for:
+#   - a prompt that names a captured Slack result through `note-trigger`, which
+#     is already in Slack;
+#   - an injected prompt by its leading text even if an adapter reported it: the
+#     host's invisible-separator marker (U+2063), a `FIRSTMATE_OP:` envelope, and
+#     harness markup a human does not type (`<task-notification>`,
+#     `<system-reminder>`, hook and local-command output, a raw slash-command
+#     envelope);
+#   - an empty or whitespace-only prompt;
+#   - a prompt already posted, by the adapter's `prompt_id` (else its text),
+#     recorded before the post, so a re-delivered turn end posts it once.
+# The acknowledgement rule applies to the exchange rather than to each side: a
+# prompt is posted before any reply that is mirrored, whatever its length, and
+# on its own only when it is itself substantive, so a short "yes" answered by a
+# short "done" stays out of the channel exactly as the reply alone would. The
+# label is `mirror_prompt_label`, by default `<Name> (terminal):` from the
+# account's full name or capitalised login. The prompt carries no worker-details
+# stamp, and a turn that also posted deliberately mirrors its prompt after that
+# deliberate post, because the prompt is only known at turn end.
 #
 # SUPPRESSION. Supervising a fleet produces many pure-acknowledgement turns, and
 # mirroring those verbatim would bury the reader. A reply is mirrored only when
@@ -115,7 +142,8 @@
 #              same Claude-shaped snake_case kind (`stop.command.input` in
 #              codex-cli 0.149.0 carries `last_assistant_message` and
 #              `transcript_path`). Its rollout transcript is not Claude-shaped,
-#              so a Codex turn reports no trigger and routes by the fallback.
+#              so a Codex turn reports no trigger and no human prompt, and
+#              routes by the fallback.
 #              Not yet proven end to end against a running Codex, whose project
 #              hooks need per-hook trust before they load; until that live run
 #              is recorded, treat this as registered-but-unproven, not covered.
@@ -128,6 +156,10 @@
 #              supplies the text, not a shell adapter.
 #   kimi       Its Stop payload carries only `hook_event_name`, `session_id`,
 #              `cwd`, and `stop_hook_active`, so the reply is simply not there.
+#   grok       (prompts only) Its reply is covered, but `updates.jsonl` marks no
+#              difference between a prompt typed at the terminal and an injected
+#              one such as a watcher wake, so adapters/grok.sh reports no human
+#              prompt rather than guessing from the text.
 #
 # CONFIGURATION - optional keys in SLACK_MIRROR_CONFIG_FILE beside `channel=`:
 #   mirror=on|off                 default on once `channel=` is set
@@ -140,14 +172,21 @@
 #                                 stamped with the model and effort the adapter
 #                                 reported, through SLACK_MIRROR_POST_CMD's own
 #                                 `--worker-details` convention
+#   mirror_prompts=on|off         default on; when on, a turn the human opened by
+#                                 typing also mirrors that prompt (THE HUMAN'S OWN
+#                                 PROMPT above)
+#   mirror_prompt_label=<text>    default `<Name> (terminal):`; the label a
+#                                 mirrored prompt starts with, spaces kept
 # Each has a `SLACK_MIRROR_*` environment override for tests and specialized
 # setups, and each of those also accepts the legacy `FM_SLACK_MIRROR_*` spelling
 # for hosts that set it: SLACK_MIRROR (the on/off switch), _ACK_MAX_CHARS,
-# _THREAD_WINDOW, _TURN_WINDOW, _MAX_CHARS, _WORKER_DETAILS, _CORRELATE_MAX,
-# _SYNC.
+# _THREAD_WINDOW, _TURN_WINDOW, _MAX_CHARS, _WORKER_DETAILS, _PROMPTS,
+# _PROMPT_LABEL, _CORRELATE_MAX, _SYNC.
 #
 # STATE, all under SLACK_MIRROR_STATE_DIR:
 #   mirror.last-body      sha256 of the last mirrored body, for the repeat test
+#   mirror.last-prompt    identity of the last mirrored human prompt, so a
+#                         re-delivered turn end never posts it twice
 #   mirror.last-post      epoch of the last deliberate post to the channel
 #   mirror.inbound        the newest captured inbound message and its thread, if any
 #   mirror.reply-target   the thread the host recorded for this turn's reply,
@@ -166,7 +205,7 @@ INBOUND_SCHEMA=fm-slack-mirror-inbound.v1
 REPLY_TARGET_SCHEMA=fm-slack-mirror-reply-target.v1
 CORRELATE_SCHEMA=fm-slack-mirror-correlate.v1
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # An environment override under either spelling: the tool's own name first, then
 # the legacy host-prefixed one, so a host that already exports the old name keeps
@@ -286,6 +325,62 @@ is_substantive() {  # <text> <ack-max-chars>
     *http://*|*https://*|*'`'*) return 0 ;;
     *'#'[0-9]*) return 0 ;;
     '- '*|'* '*|[0-9]'. '*|[0-9][0-9]'. '*) return 0 ;;
+  esac
+  return 1
+}
+
+# One key from the host's configuration file with its inner spacing kept, for
+# a free-text value such as the prompt label; only the surrounding whitespace is
+# trimmed. Empty when absent or unsafe, like config_get.
+config_get_text() {  # <key>
+  local value
+  [ -n "$CONFIG_FILE" ] || return 0
+  [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] || return 0
+  value=$(sed -n "s/^[[:space:]]*$1=//p" "$CONFIG_FILE" | tail -n1)
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s\n' "$value"
+}
+
+# The label a mirrored prompt carries: the environment override, then
+# `mirror_prompt_label`, then `<Name> (terminal):` where <Name> is the first word
+# of the account's full name, else its login name capitalised, else `Human`.
+prompt_label() {
+  local label name login
+  label=$(env_override _PROMPT_LABEL)
+  [ -n "$label" ] || label=$(config_get_text mirror_prompt_label)
+  if [ -z "$label" ]; then
+    login=$(id -un 2>/dev/null || true)
+    name=
+    if [ -n "$login" ] && command -v getent >/dev/null 2>&1; then
+      name=$(getent passwd "$login" 2>/dev/null | cut -d: -f5 | cut -d, -f1)
+    fi
+    [ -n "$name" ] || name=$(id -F 2>/dev/null || true)
+    name=${name%% *}
+    if [ -z "$name" ] && [ -n "$login" ]; then
+      name="$(printf '%s' "${login:0:1}" | tr '[:lower:]' '[:upper:]')${login:1}"
+    fi
+    [ -n "$name" ] || name=Human
+    label="$name (terminal):"
+  fi
+  printf '%s\n' "$label"
+}
+
+# A prompt this tool must never post whatever the adapter reported, by its
+# leading text: the host's injected-input marker (an invisible separator,
+# U+2063), a `FIRSTMATE_OP:` operational envelope, or harness markup a human does
+# not type - a task notification, a system reminder, hook output, local command
+# output, or an unrewritten slash-command envelope. A second line of defence
+# behind the adapter's own origin test, so a harness that mislabels an injected
+# prompt as typed still posts nothing.
+is_injected_prompt() {  # <text>
+  local text=${1-} invisible
+  invisible=$(printf '\342\201\243')
+  text=${text#"${text%%[![:space:]]*}"}
+  case "$text" in
+    "$invisible"*|FIRSTMATE_OP:*) return 0 ;;
+    '<task-notification>'*|'<system-reminder>'*|'<user-prompt-submit-hook>'*) return 0 ;;
+    '<local-command-'*|'<bash-'*|'<command-'*) return 0 ;;
   esac
   return 1
 }
@@ -442,13 +537,27 @@ inbound_thread() {  # <window-seconds>
 # matched against the trigger text as a bounded reference; the recorded thread is
 # never itself compiled into the match, so captured text can forge nothing here.
 resolve_trigger() {
-  local path line source seq thread re
   TRIGGER_MODE=fallback
   TRIGGER_THREAD=
   [ -n "${TURN_TEXT-}" ] || return 0
   TRIGGER_MODE=toplevel
+  if TRIGGER_THREAD=$(capture_thread "$TURN_TEXT"); then
+    TRIGGER_MODE=thread
+  else
+    TRIGGER_THREAD=
+  fi
+  return 0
+}
+
+# The recorded thread of the newest captured Slack result <text> names, by the
+# bounded source-id-and-sequence reference `resolve_trigger` documents. Returns
+# nonzero when the text names no capture, so the same test also tells whether a
+# prompt was a Slack message rather than something typed at the terminal.
+capture_thread() {  # <text>
+  local text=${1-} path line source seq thread re
+  [ -n "$text" ] || return 1
   path="$MIRROR_DIR/mirror.correlate"
-  [ -f "$path" ] && [ ! -L "$path" ] || return 0
+  [ -f "$path" ] && [ ! -L "$path" ] || return 1
   while IFS= read -r line; do
     case "$line" in "schema=$CORRELATE_SCHEMA "*) ;; *) continue ;; esac
     source=${line#*source=}; source=${source%% *}
@@ -456,15 +565,14 @@ resolve_trigger() {
     valid_source_id "$source" || continue
     case "$seq" in ''|*[!0-9]*) continue ;; esac
     re="(^|[^0-9A-Za-z])${source}[: ]${seq}([^0-9]|$)"
-    if [[ $TURN_TEXT =~ $re ]]; then
+    if [[ $text =~ $re ]]; then
       thread=${line#*thread=}; thread=${thread%% *}
       [ -z "$thread" ] || valid_ts "$thread" || continue
-      TRIGGER_MODE=thread
-      TRIGGER_THREAD=$thread
+      printf '%s\n' "$thread"
       return 0
     fi
   done < "$path"
-  return 0
+  return 1
 }
 
 # Every adapter file, in a stable order.
@@ -518,8 +626,9 @@ cmd_adapters() {
 
 cmd_turn_end() {
   local payload_file tmpdir adapter record
-  local channel enabled ack_max window max_chars details_flag
+  local channel enabled ack_max window max_chars details_flag prompts_flag
   local body turn_epoch post_epoch digest last_digest thread details
+  local prompt prompt_id prompt_key last_prompt reply_ok=0 prompt_ok=0
   local REPLY_TARGET_SET=0 REPLY_TARGET_THREAD=
   local TURN_TEXT='' TRIGGER_MODE=fallback TRIGGER_THREAD=''
   local model effort
@@ -551,8 +660,12 @@ cmd_turn_end() {
   [ -n "$record" ] || return 0
 
   body=$(printf '%s' "$record" | jq -r '
-      if (.final_text | type) == "string" then .final_text else "" end' 2>/dev/null) || return 0
-  [ -n "$body" ] || return 0
+      if (.final_text | type) == "string" then .final_text else "" end' 2>/dev/null) || body=
+  prompt=$(printf '%s' "$record" | jq -r '
+      if (.prompt_text | type) == "string" then .prompt_text else "" end' 2>/dev/null) || prompt=
+  [ -n "$body" ] || [ -n "$prompt" ] || return 0
+  prompt_id=$(printf '%s' "$record" | jq -r '
+      if (.prompt_id | type) == "string" then .prompt_id else "" end' 2>/dev/null) || prompt_id=
   TURN_TEXT=$(printf '%s' "$record" | jq -r '
       if (.trigger_text | type) == "string" then .trigger_text else "" end' 2>/dev/null) || TURN_TEXT=
   turn_epoch=$(printf '%s' "$record" | jq -r '
@@ -566,34 +679,57 @@ cmd_turn_end() {
   ack_max=$(setting_int "$(env_override _ACK_MAX_CHARS)" mirror_ack_max_chars 120)
   max_chars=$(setting_int "$(env_override _MAX_CHARS)" mirror_max_chars 3500)
   details_flag=$(setting_flag "$(env_override _WORKER_DETAILS)" mirror_worker_details off)
+  prompts_flag=$(setting_flag "$(env_override _PROMPTS)" mirror_prompts on)
 
-  is_substantive "$body" "$ack_max" || return 0
-
-  # A deliberate post inside this turn's own window is the message; mirroring it
-  # again would double-post.
-  post_epoch=$(state_read "$MIRROR_DIR/mirror.last-post" 2>/dev/null || true)
-  case "$post_epoch" in
-    ''|*[!0-9]*) ;;
-    *)
-      case "$turn_epoch" in
-        ''|*[!0-9]*)
-          # No dated turn start, so fall back to an assumed turn length rather
-          # than losing the duplicate test entirely.
-          turn_epoch=$(( $(now_epoch) - $(setting_int "$(env_override _TURN_WINDOW)" \
-            mirror_turn_window 900) ))
-          ;;
-      esac
-      [ "$post_epoch" -lt "$turn_epoch" ] || return 0
-      ;;
-  esac
-
-  if [ "${#body}" -gt "$max_chars" ]; then
-    body=$(printf '%s\n\n_[truncated by the terminal mirror]_' "${body:0:$max_chars}")
+  # THE REPLY: substantive, not already posted deliberately this turn, and not a
+  # repeat of the last mirrored body.
+  if [ -n "$body" ] && is_substantive "$body" "$ack_max"; then
+    reply_ok=1
+    # A deliberate post inside this turn's own window is the message; mirroring
+    # it again would double-post.
+    post_epoch=$(state_read "$MIRROR_DIR/mirror.last-post" 2>/dev/null || true)
+    case "$post_epoch" in
+      ''|*[!0-9]*) ;;
+      *)
+        case "$turn_epoch" in
+          ''|*[!0-9]*)
+            # No dated turn start, so fall back to an assumed turn length rather
+            # than losing the duplicate test entirely.
+            turn_epoch=$(( $(now_epoch) - $(setting_int "$(env_override _TURN_WINDOW)" \
+              mirror_turn_window 900) ))
+            ;;
+        esac
+        [ "$post_epoch" -lt "$turn_epoch" ] || reply_ok=0
+        ;;
+    esac
+  fi
+  if [ "$reply_ok" = 1 ]; then
+    if [ "${#body}" -gt "$max_chars" ]; then
+      body=$(printf '%s\n\n_[truncated by the terminal mirror]_' "${body:0:$max_chars}")
+    fi
+    digest=$(body_digest "$body") || return 0
+    last_digest=$(state_read "$MIRROR_DIR/mirror.last-body" 2>/dev/null || true)
+    [ "$digest" != "$last_digest" ] || reply_ok=0
   fi
 
-  digest=$(body_digest "$body") || return 0
-  last_digest=$(state_read "$MIRROR_DIR/mirror.last-body" 2>/dev/null || true)
-  [ "$digest" != "$last_digest" ] || return 0
+  # THE PROMPT: a genuine human-typed prompt not already posted, not a Slack
+  # message, and either paired with a mirrored reply or substantive by itself.
+  if [ "$prompts_flag" = on ] && [ -n "$(printf '%s' "$prompt" | tr -d '[:space:]')" ] \
+      && ! is_injected_prompt "$prompt" && ! capture_thread "$prompt" >/dev/null; then
+    prompt_key=$prompt_id
+    [ -n "$prompt_key" ] || prompt_key=$(body_digest "$prompt") || prompt_key=
+    case "$prompt_key" in
+      ''|*[!A-Za-z0-9._-]*) prompt_key=$(body_digest "$prompt_key") || prompt_key= ;;
+    esac
+    last_prompt=$(state_read "$MIRROR_DIR/mirror.last-prompt" 2>/dev/null || true)
+    if [ -n "$prompt_key" ] && [ "$prompt_key" != "$last_prompt" ]; then
+      if [ "$reply_ok" = 1 ] || is_substantive "$prompt" "$ack_max"; then
+        prompt_ok=1
+      fi
+    fi
+  fi
+
+  [ "$reply_ok" = 1 ] || [ "$prompt_ok" = 1 ] || return 0
 
   # Precedence: the explicit record the host wrote for this turn wins; else
   # auto-detect from the message that opened the turn; else, only when the trigger
@@ -616,27 +752,68 @@ cmd_turn_end() {
     [ -z "$effort" ] || details="$model $effort"
   fi
 
-  # Recorded before the post is attempted: the repeat test is a courtesy, and a
-  # failure this tool deliberately never learns about must not leave the next
-  # identical turn eligible to retry into a channel that may already have it.
-  state_write "$MIRROR_DIR/mirror.last-body" "$digest" || return 0
+  # Both records are written before the post is attempted: the repeat tests are
+  # a courtesy, and a failure this tool deliberately never learns about must not
+  # leave a re-delivered turn end eligible to retry into a channel that may
+  # already have the message.
+  if [ "$prompt_ok" = 1 ]; then
+    state_write "$MIRROR_DIR/mirror.last-prompt" "$prompt_key" || return 0
+    prompt=$(prompt_body "$prompt" "$max_chars")
+  else
+    prompt=
+  fi
+  if [ "$reply_ok" = 1 ]; then
+    state_write "$MIRROR_DIR/mirror.last-body" "$digest" || return 0
+  else
+    body=
+  fi
 
-  send "$channel" "$body" "$thread" "$details"
+  send "$channel" "$prompt" "$body" "$thread" "$details"
   return 0
 }
 
-# Stage the body and hand it to the delivery child. Detached by default, so the
-# turn ends without waiting for Slack at all; SLACK_MIRROR_SYNC=1 delivers
-# inline for tests.
-send() {  # <channel> <body> <thread-or-empty> <details-or-empty>
-  local channel=$1 body=$2 thread=$3 details=$4 dir file args
-  dir=$(mktemp -d "${TMPDIR:-/tmp}/slack-mirror-send.XXXXXX" 2>/dev/null) || return 0
-  file="$dir/body.txt"
-  printf '%s\n' "$body" > "$file" 2>/dev/null || { rm -rf -- "$dir"; return 0; }
+# A prompt as it is posted: the label, then the prompt verbatim - on the same
+# line for a one-line prompt, on the next for a longer one, so a leading code
+# block or list still renders - truncated like a reply above <max-chars>.
+prompt_body() {  # <prompt> <max-chars>
+  local prompt=$1 max=$2 label nl
+  label=$(prompt_label)
+  if [ "${#prompt}" -gt "$max" ]; then
+    prompt=$(printf '%s\n\n_[truncated by the terminal mirror]_' "${prompt:0:$max}")
+  fi
+  nl=$(printf 'x\nx')
+  nl=${nl#x}
+  nl=${nl%x}
+  case "$prompt" in
+    *"$nl"*) printf '%s\n%s\n' "$label" "$prompt" ;;
+    *)       printf '%s %s\n' "$label" "$prompt" ;;
+  esac
+}
 
-  args=( "$SCRIPT_DIR/slack-mirror.sh" deliver "$channel" "$file" )
+# Stage the prompt and the reply and hand both to one delivery child, which
+# posts the prompt first so the two can never arrive out of order. Detached by
+# default, so the turn ends without waiting for Slack at all;
+# SLACK_MIRROR_SYNC=1 delivers inline for tests.
+send() {  # <channel> <prompt-or-empty> <body-or-empty> <thread-or-empty> <details-or-empty>
+  local channel=$1 prompt=$2 body=$3 thread=$4 details=$5 dir file args
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/slack-mirror-send.XXXXXX" 2>/dev/null) || return 0
+  if [ -n "$body" ]; then
+    file="$dir/body.txt"
+    printf '%s\n' "$body" > "$file" 2>/dev/null || { rm -rf -- "$dir"; return 0; }
+    args=( "$SCRIPT_DIR/slack-mirror.sh" deliver "$channel" "$file" )
+    if [ -n "$prompt" ]; then
+      printf '%s\n' "$prompt" > "$dir/prompt.txt" 2>/dev/null || { rm -rf -- "$dir"; return 0; }
+      args+=( --prompt-file "$dir/prompt.txt" )
+    fi
+    [ -z "$details" ] || args+=( --worker-details "$details" )
+  else
+    # A prompt with no reply of its own is a human's message, so it carries no
+    # worker-details stamp.
+    file="$dir/prompt.txt"
+    printf '%s\n' "$prompt" > "$file" 2>/dev/null || { rm -rf -- "$dir"; return 0; }
+    args=( "$SCRIPT_DIR/slack-mirror.sh" deliver "$channel" "$file" )
+  fi
   [ -z "$thread" ] || args+=( --thread "$thread" )
-  [ -z "$details" ] || args+=( --worker-details "$details" )
 
   if [ "$(env_override _SYNC)" = 1 ]; then
     "${args[@]}" >/dev/null 2>&1 || true
@@ -656,13 +833,32 @@ send() {  # <channel> <body> <thread-or-empty> <details-or-empty>
 
 # The delivery child. `--origin mirror` is what keeps this post out of the
 # deliberate-post record, so the mirror can never suppress itself next turn.
-cmd_deliver() {  # <channel> <body-file> [--thread <ts>] [--worker-details <d>]
-  local channel=${1-} file=${2-} dir
+# `--prompt-file` names a staged human prompt posted first, into the same
+# thread, without the worker-details stamp; the remaining options pass to
+# SLACK_MIRROR_POST_CMD unchanged.
+cmd_deliver() {  # <channel> <body-file> [--prompt-file <path>] [--thread <ts>] [--worker-details <d>]
+  local channel=${1-} file=${2-} dir prompt_file='' thread=''
+  local -a rest=()
   shift 2 2>/dev/null || return 0
   [ -n "$channel" ] && [ -f "$file" ] && [ ! -L "$file" ] || return 0
   [ -n "$POST_CMD" ] && [ -x "$POST_CMD" ] || return 0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --prompt-file) [ "$#" -ge 2 ] || break; prompt_file=$2; shift 2 ;;
+      --thread) [ "$#" -ge 2 ] || break; thread=$2; rest+=( "$1" "$2" ); shift 2 ;;
+      *) rest+=( "$1" ); shift ;;
+    esac
+  done
   dir=$(dirname "$file")
-  "$POST_CMD" "$channel" --file "$file" --origin mirror "$@" >/dev/null 2>&1 || true
+  if [ -n "$prompt_file" ] && [ -f "$prompt_file" ] && [ ! -L "$prompt_file" ]; then
+    if [ -n "$thread" ]; then
+      "$POST_CMD" "$channel" --file "$prompt_file" --origin mirror --thread "$thread" \
+        >/dev/null 2>&1 || true
+    else
+      "$POST_CMD" "$channel" --file "$prompt_file" --origin mirror >/dev/null 2>&1 || true
+    fi
+  fi
+  "$POST_CMD" "$channel" --file "$file" --origin mirror ${rest[@]+"${rest[@]}"} >/dev/null 2>&1 || true
   case "$dir" in
     */slack-mirror-send.*) rm -rf -- "$dir" ;;
   esac
